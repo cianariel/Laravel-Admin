@@ -7,6 +7,7 @@ use App\Models\Lead;
 use App\Models\LeadActivity;
 use App\Models\Response;
 use App\Models\GlobalSettings;
+use App\Repositories\CampaignStatistics;
 use App\Services\CloudOneService;
 use App\Services\FacebookAdsService;
 use DB;
@@ -306,212 +307,26 @@ class CampaignController extends Controller
     {
         $startDate = Carbon::createFromFormat('Y-m-d', $request->input('start_date') ?? Carbon::now()->subMonths(1)->toDateString());
         $endDate = Carbon::createFromFormat('Y-m-d', $request->input('end_date') ?? Carbon::now()->toDateString());
-        $newLeadsOverTime = $campaign->leads()
-            ->new()
-            ->selectRaw('DATE(last_status_changed_at) as date, COUNT(id) as total')
-            ->groupBy(DB::raw('DATE(last_status_changed_at)'))
-            ->whereDate('last_status_changed_at', '>=', $startDate)
-            ->whereDate('last_status_changed_at', '<=', $endDate)
-            ->orderBy('last_status_changed_at', 'ASC')
-            ->get();
-        $leadsOpenOverTime = $campaign->leads()
-            ->open()
-            ->selectRaw('DATE(last_status_changed_at) as date, COUNT(id) as total')
-            ->groupBy(DB::raw('DATE(last_status_changed_at)'))
-            ->whereDate('last_status_changed_at', '>=', $startDate)
-            ->whereDate('last_status_changed_at', '<=', $endDate)
-            ->orderBy('last_status_changed_at', 'ASC')
-            ->get();
-        $leadsClosedOverTime = $campaign->leads()
-            ->closed()
-            ->selectRaw('DATE(last_status_changed_at) as date, COUNT(id) as total')
-            ->groupBy(DB::raw('DATE(last_status_changed_at)'))
-            ->whereDate('last_status_changed_at', '>=', $startDate)
-            ->whereDate('last_status_changed_at', '<=', $endDate)
-            ->orderBy('last_status_changed_at', 'ASC')
-            ->get();
-        $appointmentsOverTime = $campaign->appointments()
-            ->selectRaw('DATE(appointment_at) as date, COUNT(id) as total')
-            ->groupBy(DB::raw('DATE(appointment_at)'))
-            ->whereDate('appointment_at', '>=', $startDate)
-            ->whereDate('appointment_at', '<=', $endDate)
-            ->where('type', Appointment::TYPE_APPOINTMENT)
-            ->orderBy('appointment_at', 'ASC')
-            ->get();
-        $callbacksOverTime = $campaign->appointments()
-            ->selectRaw('DATE(appointment_at) as date, COUNT(id) as total')
-            ->groupBy(DB::raw('DATE(appointment_at)'))
-            ->whereDate('appointment_at', '>=', $startDate)
-            ->whereDate('appointment_at', '<=', $endDate)
-            ->where('type', Appointment::TYPE_CALLBACK)
-            ->orderBy('appointment_at', 'ASC')
-            ->get();
-        // Average time to open
-        $firstResponsePerRecipient = $campaign->responses()
-            ->selectRaw('MIN(created_at) as created_at, recipient_id')
-            ->groupBy('recipient_id');
-        $firstOpenActivityPerRecipient = Activity::selectRaw('MIN(created_at) as created_at, subject_id as recipient_id')
-            ->where('subject_type', Lead::class)
-            ->where('description', LeadActivity::OPENED)
-            ->whereIn('subject_id', function ($query) use ($campaign) {
-                $query->select('id')
-                    ->from('recipients')
-                    ->where('recipients.campaign_id', $campaign->id);
-            })
-            ->groupBy('subject_id');
-        $averageTimeToOpen = DB::query()
-            ->selectRaw('AVG(TIMESTAMPDIFF(SECOND, q1.created_at, q2.created_at)) AS total')
-            ->from(DB::raw("({$firstResponsePerRecipient->toSql()}) as q1"))
-            ->mergeBindings($firstResponsePerRecipient->getQuery()->getQuery())
-            ->join(DB::raw("({$firstOpenActivityPerRecipient->toSql()}) as q2"), function ($join) {
-                $join->on('q1.recipient_id', '=', 'q2.recipient_id');
-            })
-            ->mergeBindings($firstOpenActivityPerRecipient->getQuery())
-            ->first();
-        if ($averageTimeToOpen->total) {
-            $averageTimeToOpen = $averageTimeToOpen->total;
-        } else {
-            $averageTimeToOpen = 0;
-        }
-        // Average time to close
-        $firstResponsePerRecipient = $campaign->responses()
-            ->selectRaw('MIN(created_at) as created_at, recipient_id')
-            ->groupBy('recipient_id');
-        $lastCloseActivityPerRecipient = Activity::selectRaw('MAX(created_at) as created_at, subject_id as recipient_id')
-            ->where('subject_type', Lead::class)
-            ->where('description', LeadActivity::CLOSED)
-            ->whereIn('subject_id', function ($query) use ($campaign) {
-                $query->select('id')
-                    ->from('recipients')
-                    ->where('recipients.campaign_id', $campaign->id);
-            })
-            ->groupBy('subject_id');
-        $averageTimeToClose = DB::query()
-            ->selectRaw('AVG(TIMESTAMPDIFF(SECOND, q1.created_at, q2.created_at)) AS total')
-            ->from(DB::raw("({$firstResponsePerRecipient->toSql()}) as q1"))
-            ->mergeBindings($firstResponsePerRecipient->getQuery()->getQuery())
-            ->join(DB::raw("({$lastCloseActivityPerRecipient->toSql()}) as q2"), function ($join) {
-                $join->on('q1.recipient_id', '=', 'q2.recipient_id');
-            })
-            ->mergeBindings($lastCloseActivityPerRecipient->getQuery())
-            ->first();
-        if ($averageTimeToClose->total) {
-            $averageTimeToClose = $averageTimeToClose->total;
-        } else {
-            $averageTimeToClose = 0;
-        }
-        // Outcomes
-        $leadsWithOutcome = $campaign->leads()
-            ->whereDate('last_status_changed_at', '>=', $startDate)
-            ->whereDate('last_status_changed_at', '<=', $endDate)
-            ->whereNotNull('recipients.outcome')
-            ->get();
-        $resumeOutcomes = [
-            Lead::POSITIVE_OUTCOME => [
-                'total' => 0,
-                'tags' => (object) []
-            ],
-            Lead::NEGATIVE_OUTCOME => [
-                'total' => 0,
-                'tags' => (object) []
-            ]
-        ];
-        foreach ($leadsWithOutcome as $ld) {
-            $resumeOutcomes[$ld->outcome]['total']++;
-            foreach ($ld->tags as $tag) {
-                if (!property_exists($resumeOutcomes[$ld->outcome]['tags'], $tag)) {
-                    $resumeOutcomes[$ld->outcome]['tags']->$tag = 0;
-                }
-                $resumeOutcomes[$ld->outcome]['tags']->$tag++;
-            }
-        }
-        // Overall ranking for point-holders
-        $ranking = $campaign->getOverallRanking();
-        // Leads by email
-        $leadsByEmail = $campaign->leads()
-            ->join('responses', 'responses.recipient_id', '=', 'recipients.id')
-            ->where('responses.type', 'email')
-            ->whereDate('responses.created_at', '>=', $startDate)
-            ->whereDate('responses.created_at', '<=', $endDate)
-            ->groupBy('recipients.id')
-            ->selectRaw('recipients.id')
-            ->get()
-            ->count();
-        $leadsByPhone = $campaign->leads()
-            ->join('responses', 'responses.recipient_id', '=', 'recipients.id')
-            ->where('responses.type', 'phone')
-            ->whereDate('responses.created_at', '>=', $startDate)
-            ->whereDate('responses.created_at', '<=', $endDate)
-            ->groupBy('recipients.id')
-            ->selectRaw('recipients.id')
-            ->get()
-            ->count();
-        $leadsBySms = $campaign->leads()
-            ->join('responses', 'responses.recipient_id', '=', 'recipients.id')
-            ->where('responses.type', 'text')
-            ->whereDate('responses.created_at', '>=', $startDate)
-            ->whereDate('responses.created_at', '<=', $endDate)
-            ->groupBy('recipients.id')
-            ->selectRaw('recipients.id')
-            ->get()
-            ->count();
-        // List of open leads by time
-        $leadsOpenedWithTime = DB::query()
-            ->selectRaw('TIMESTAMPDIFF(SECOND, q1.created_at, q2.created_at) AS total')
-            ->from(DB::raw("({$firstResponsePerRecipient->toSql()}) as q1"))
-            ->mergeBindings($firstResponsePerRecipient->getQuery()->getQuery())
-            ->join(DB::raw("({$firstOpenActivityPerRecipient->toSql()}) as q2"), function ($join) {
-                $join->on('q1.recipient_id', '=', 'q2.recipient_id');
-            })
-            ->mergeBindings($firstOpenActivityPerRecipient->getQuery())
-            ->get();
-        // Count number of leads per range of hours
-        // The range of hours follow a 1hour gap until 12hrs. i.e: 0-1hr, 1-2hr, 2-3hr, ... ,12+hrs
-        $leadsOpenByTime = array_fill(0, 12, 0);
-        foreach ($leadsOpenedWithTime as $lead) {
-            $hours = floor($lead->total / SECONDS_PER_HOUR);
-            if ($hours < 0) continue;
-            if ($hours > 11) {
-                $leadsOpenByTime[11]++;
-            } else {
-                $leadsOpenByTime[$hours]++;
-            }
-        }
-        // List of closed leads by time
-        $leadsClosedWithTime = DB::query()
-            ->selectRaw('TIMESTAMPDIFF(SECOND, q1.created_at, q2.created_at) AS total')
-            ->from(DB::raw("({$firstResponsePerRecipient->toSql()}) as q1"))
-            ->mergeBindings($firstResponsePerRecipient->getQuery()->getQuery())
-            ->join(DB::raw("({$lastCloseActivityPerRecipient->toSql()}) as q2"), function ($join) {
-                $join->on('q1.recipient_id', '=', 'q2.recipient_id');
-            })
-            ->mergeBindings($lastCloseActivityPerRecipient->getQuery())
-            ->get();
-        $leadsClosedByTime = array_fill(0, 7, 0);
-        foreach ($leadsClosedWithTime as $lead) {
-            $days = floor($lead->total / SECONDS_PER_DAY);
-            if ($days > 6) {
-                $leadsClosedByTime[6]++;
-            } else {
-                $leadsClosedByTime[$days]++;
-            }
-        }
+
+        $campaignStats = new CampaignStatistics($campaign, $startDate, $endDate);
+        $stats = $campaignStats->all();
+
         $viewData = [
             'campaign' => $campaign,
-            'newLeadsOverTime' => $newLeadsOverTime,
-            'leadsOpenOverTime' => $leadsOpenOverTime,
-            'leadsClosedOverTime' => $leadsClosedOverTime,
-            'appointmentsOverTime' => $appointmentsOverTime,
-            'callbacksOverTime' => $callbacksOverTime,
-            'averageTimeToOpen' => $averageTimeToOpen,
-            'averageTimeToClose' => $averageTimeToClose,
-            'outcomes' => $resumeOutcomes,
-            'leadsClosedByTime' => $leadsClosedByTime,
-            'leadsOpenByTime' => $leadsOpenByTime,
-            'leadsByEmail' => $leadsByEmail,
-            'leadsByPhone' => $leadsByPhone,
-            'leadsBySms' => $leadsBySms,
-            'ranking' => $ranking
+            'newLeadsOverTime' => $stats->newLeadsOverTime,
+            'leadsOpenOverTime' => $stats->leadsOpenOverTime,
+            'leadsClosedOverTime' => $stats->leadsClosedOverTime,
+            'appointmentsOverTime' => $stats->appointmentsOverTime,
+            'callbacksOverTime' => $stats->callbacksOverTime,
+            'averageTimeToOpen' => $stats->averageTimeToOpen,
+            'averageTimeToClose' => $stats->averageTimeToClose,
+            'outcomes' => $stats->outcomes,
+            'leadsClosedByTime' => $stats->leadsClosedByTime,
+            'leadsOpenByTime' => $stats->leadsOpenByTime,
+            'leadsByEmail' => $stats->leadsByEmail,
+            'leadsByPhone' => $stats->leadsByPhone,
+            'leadsBySms' => $stats->leadsBySms,
+            'ranking' => $stats->ranking
         ];
 
         return $viewData;
